@@ -15,6 +15,9 @@ header{display:flex;justify-content:space-between;align-items:center;font-family
 .status{display:flex;align-items:center;gap:6px}
 .status::before{content:'';width:9px;height:9px;border-radius:50%;background:var(--red)}
 .status.on::before{background:var(--green)}
+.status.wait{color:var(--gold)}
+.status.wait::before{background:var(--gold);animation:blink .6s infinite alternate}
+@keyframes blink{to{opacity:.3}}
 .now{background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);border-radius:16px;padding:14px 16px}
 .chap{font-family:'Special Elite',monospace;color:var(--gold);font-size:.75rem;letter-spacing:.15em;text-transform:uppercase}
 .ttl{font-family:'Bebas Neue',Impact,sans-serif;font-size:2.2rem;line-height:1;margin-top:4px}
@@ -57,29 +60,62 @@ const $=id=>document.getElementById(id);
 // #topic in the URL → internet mode through the ntfy.sh relay; otherwise local server.js
 const RELAY='https://ntfy.sh/';
 const topic=decodeURIComponent(location.hash.slice(1));
-let send,es;
+let post,es;
+// a send that hangs (seen when the relay throttles) counts as failed after 6 s and is retried
+const timed=(url,body)=>fetch(url,{method:'POST',body,signal:AbortSignal.timeout(6000)}).then(r=>r.ok,()=>false);
 if(topic){
-  send=c=>fetch(RELAY+topic,{method:'POST',body:'c:'+c}).catch(()=>{});
+  post=m=>timed(RELAY+topic,'c:'+m);
   es=new EventSource(RELAY+topic+'/sse');
   es.onmessage=e=>{const m=JSON.parse(e.data).message||'';if(m.startsWith('s:'))render(JSON.parse(m.slice(2)))};
 }else{
-  send=c=>fetch('/cmd',{method:'POST',body:JSON.stringify({c})}).catch(()=>{});
+  post=m=>timed('/cmd',JSON.stringify({c:m}));
   es=new EventSource('/events');
   es.addEventListener('state',e=>render(JSON.parse(e.data)));
 }
-function tap(c){send(c);navigator.vibrate?.(15)}
+
+// Taps go through a queue: nothing is lost if the relay says "too many requests" (it
+// allows ~60 then 1 per 5 s); failed sends are retried, and repeated taps that pile up
+// meanwhile are merged into one message ("next:3") to save requests.
+const queue=[];let busy=false,online=false,slow=false;
+function setStatus(){
+  const st=$('status'),waiting=queue.length>0&&(slow||busy==='retry');
+  st.classList.toggle('on',online&&!waiting);
+  st.classList.toggle('wait',online&&waiting);
+  st.textContent=!online?'offline':waiting?`⏳ wait (${queue.reduce((a,q)=>a+q.n,0)})`:'live';
+}
+function tap(c){
+  const last=queue[queue.length-1];
+  if(last&&last.c===c&&queue.length>1&&(c==='next'||c==='prev'))last.n++; // queue[0] may be in flight
+  else queue.push({c,n:1});
+  navigator.vibrate?.(15);pump();
+}
+async function pump(){
+  if(busy)return; // one pump at a time, including while it waits to retry
+  let delay=1500;
+  while(queue.length){
+    busy=true;setStatus();
+    const q=queue[0];
+    const slowT=setTimeout(()=>{slow=true;setStatus()},1000);
+    const ok=await post(q.n>1?q.c+':'+q.n:q.c);
+    clearTimeout(slowT);slow=false;
+    if(ok){queue.shift();delay=1500;continue}
+    busy='retry';setStatus();
+    await new Promise(r=>setTimeout(r,delay));delay=Math.min(delay*1.6,15000); // back off so retries don't eat the bucket's refill
+  }
+  busy=false;setStatus();
+}
 $('next').onclick=()=>tap('next');
 $('prev').onclick=()=>tap('prev');
 $('act').onclick=()=>tap('action');
 $('pv').onclick=()=>tap('pv');
 
-es.onopen=()=>{$('status').textContent='live';$('status').classList.add('on');if(topic)send('hello')};
-es.onerror=()=>{$('status').textContent='offline';$('status').classList.remove('on')};
+es.onopen=()=>{online=true;setStatus();if(topic)tap('hello')};
+es.onerror=()=>{online=false;setStatus()};
 function render(s){
   $('chap').textContent=s.chapter||'';
   $('ttl').textContent=s.title||'';
   $('num').textContent=`Slide ${s.i+1} / ${s.n}`;
-  $('frag').textContent=s.fragTotal?`Text ${s.fragShown}/${s.fragTotal}`:'';
+  $('frag').textContent=s.fragTotal?`${s.fragTotal} sentences`:'';
   $('bar').style.width=((s.i+1)/s.n*100)+'%';
   $('act').disabled=!s.action;
   $('act').textContent=s.action||'Action';
